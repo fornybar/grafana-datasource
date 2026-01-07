@@ -13,7 +13,7 @@ import (
 	"github.com/feldera/feldera/pkg/models"
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/instancemgmt"
-	"github.com/grafana/infinity-libs/lib/go/jsonframer"
+	"github.com/grafana/grafana-plugin-sdk-go/data"
 )
 
 // Make sure Datasource implements required interfaces. This is important to do
@@ -35,17 +35,17 @@ func NewDatasource(_ context.Context, setting backend.DataSourceInstanceSettings
 	}
 
 	return &Datasource{
-		client: http.Client{},
+		client:   http.Client{},
 		pipeline: settings.Pipeline,
-		baseUrl: settings.BaseUrl,
+		baseUrl:  settings.BaseUrl,
 	}, nil
 }
 
 // Datasource is an example datasource which can respond to data queries, reports
 // its health and has streaming skills.
-type Datasource struct{
-	client http.Client
-	baseUrl string
+type Datasource struct {
+	client   http.Client
+	baseUrl  string
 	pipeline string
 }
 
@@ -76,8 +76,8 @@ func (d *Datasource) QueryData(ctx context.Context, req *backend.QueryDataReques
 	return response, nil
 }
 
-type queryModel struct{
-	QueryText string		`json:"queryText"`
+type queryModel struct {
+	QueryText string `json:"queryText"`
 }
 
 func (d *Datasource) query(_ context.Context, pCtx backend.PluginContext, query backend.DataQuery) backend.DataResponse {
@@ -89,7 +89,7 @@ func (d *Datasource) query(_ context.Context, pCtx backend.PluginContext, query 
 	// TODO: query.TimeRange
 	// query.MaxDataPoints
 	// query.Interval
-	
+
 	err := json.Unmarshal(query.JSON, &qm)
 	if err != nil {
 		return backend.ErrDataResponse(backend.StatusValidationFailed, fmt.Sprintf("json unmarshal: %v", err.Error()))
@@ -143,30 +143,159 @@ func (d *Datasource) query(_ context.Context, pCtx backend.PluginContext, query 
 				fmt.Sprintf("err: query failed, status: %s", resp.Status))
 		}
 		errMsg := string(msg)
-		
-		return backend.ErrDataResponse(backend.StatusBadRequest, 
+
+		return backend.ErrDataResponse(backend.StatusBadRequest,
 			fmt.Sprintf("err: query failed, status: '%s', error: %s", resp.Status, errMsg))
 	}
 
 	contents, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return backend.ErrDataResponse(backend.StatusInternal,
-			fmt.Sprintf("err: query failed, status: '%s', error: %s", resp.Status, err.Error()))
+			fmt.Sprintf("err: failed to read response body: %v", err.Error()))
 	}
 
+	// Handle empty response (no rows)
+	if len(strings.TrimSpace(string(contents))) == 0 {
+		response.Frames = append(response.Frames, data.NewFrame("response"))
+		return response
+	}
 
-	jsonstr := "[" + strings.TrimSpace(string(contents))
-	jsonstr = strings.ReplaceAll(jsonstr, "\n", ", ") + "]"
-
-	frame, err := jsonframer.ToFrame(jsonstr, jsonframer.FramerOptions{})
+	frame, err := parseJSONResponse(contents)
 	if err != nil {
 		return backend.ErrDataResponse(backend.StatusInternal,
-			fmt.Sprintf("err: query failed, status: '%s', error: %s", resp.Status, err.Error()))
+			fmt.Sprintf("err: failed to parse response: %v", err.Error()))
 	}
 
 	response.Frames = append(response.Frames, frame)
 
 	return response
+}
+
+// parseJSONResponse parses Feldera's newline-delimited JSON and converts timestamps
+func parseJSONResponse(contents []byte) (*data.Frame, error) {
+	jsonStr := "[" + strings.TrimSpace(string(contents))
+	jsonStr = strings.ReplaceAll(jsonStr, "\n", ", ") + "]"
+
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(jsonStr), &rows); err != nil {
+		return nil, fmt.Errorf("json unmarshal: %v", err)
+	}
+
+	if len(rows) == 0 {
+		return data.NewFrame("response"), nil
+	}
+
+	var colNames []string
+	for name := range rows[0] {
+		colNames = append(colNames, name)
+	}
+
+	fields := make([]*data.Field, len(colNames))
+	for i, name := range colNames {
+		values := make([]any, len(rows))
+		for j, row := range rows {
+			values[j] = row[name]
+		}
+		fields[i] = createField(name, values)
+	}
+
+	frame := data.NewFrame("response", fields...)
+	return frame, nil
+}
+
+func createField(name string, values []any) *data.Field {
+	if len(values) == 0 {
+		return data.NewField(name, nil, []*string{})
+	}
+
+	if isTimestampColumn(values) {
+		times := make([]*time.Time, len(values))
+		for i, v := range values {
+			if v == nil {
+				times[i] = nil
+				continue
+			}
+			if s, ok := v.(string); ok {
+				if t, err := parseTimestamp(s); err == nil {
+					times[i] = &t
+				}
+			}
+		}
+		return data.NewField(name, nil, times)
+	}
+
+	if isNumericColumn(values) {
+		nums := make([]*float64, len(values))
+		for i, v := range values {
+			if v == nil {
+				nums[i] = nil
+				continue
+			}
+			if n, ok := v.(float64); ok {
+				nums[i] = &n
+			}
+		}
+		return data.NewField(name, nil, nums)
+	}
+
+	strs := make([]*string, len(values))
+	for i, v := range values {
+		if v == nil {
+			strs[i] = nil
+			continue
+		}
+		s := fmt.Sprintf("%v", v)
+		strs[i] = &s
+	}
+	return data.NewField(name, nil, strs)
+}
+
+func isTimestampColumn(values []any) bool {
+	for _, v := range values {
+		if v == nil {
+			continue
+		}
+		s, ok := v.(string)
+		if !ok {
+			return false
+		}
+		if _, err := parseTimestamp(s); err != nil {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+func parseTimestamp(s string) (time.Time, error) {
+	formats := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05.999999",
+		"2006-01-02 15:04:05.999",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	}
+	for _, format := range formats {
+		if t, err := time.Parse(format, s); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("not a timestamp: %s", s)
+}
+
+func isNumericColumn(values []any) bool {
+	for _, v := range values {
+		if v == nil {
+			continue
+		}
+		if _, ok := v.(float64); !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // CheckHealth handles health checks sent from Grafana to the plugin.
@@ -208,7 +337,6 @@ func (d *Datasource) CheckHealth(_ context.Context, req *backend.CheckHealthRequ
 		res.Message = "Invalid response from data source"
 		return res, nil
 	}
-
 
 	return &backend.CheckHealthResult{
 		Status:  backend.HealthStatusOk,
